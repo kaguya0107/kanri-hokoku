@@ -1,36 +1,109 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# WCR — 作業完了報告書SYSTEM
 
-## Getting Started
+Work-completion report system for hospital facility maintenance inspections. Field engineers file inspection reports from a tablet on-site; facility-management staff review, generate PDFs, and manage shared masters from a desktop admin console.
 
-First, run the development server:
+Built against the client's concept document (概要書) as a full-stack Next.js application — not a static prototype. Every screen reads and writes real data through Prisma/PostgreSQL, including a 10,000-row parts master with sub-2ms search.
+
+## Status
+
+All screens specified in the concept document are implemented and working end to end: login → report wizard (2-1–2-6) → PDF/mail → internal report (4-1–4-6) → My Page (5-1–5-3) → admin console (K-1–K-7).
+
+Two things are intentionally incomplete:
+
+- **Mail delivery is stubbed.** `sendReportMail` (`src/server/mail.ts`) validates input, renders the PDF, checks rate limits, and logs every attempt — but `deliver()` only logs to console unless `SMTP_URL` is set, in which case it throws. Wiring a real transport (e.g. `nodemailer`) is the remaining step.
+- **Offline support is at Tier 1 only.** Form state persists to `localStorage` across navigation (`src/components/form-persist.tsx`), but there's no Service Worker or background sync yet. The schema already supports Tier 2 (`Report.uuid` for idempotent upsert, `Report.version` for optimistic locking) — see [Architecture decisions](#architecture-decisions).
+
+## Stack
+
+| Layer | Choice | Why |
+|---|---|---|
+| Framework | Next.js 15 (App Router), React 19, TypeScript | Pinned to 15, not 16 — the toolchain wants Node 20.19+/22 and this runs on 20.20.2 |
+| Database | PostgreSQL 16 + Prisma 6 | See schema notes below |
+| Auth | Custom, `jose` (JWT) + `bcryptjs` | Session cookies signed with `AUTH_SECRET`; no external auth provider — accounts are issued per *company*, not per person, matching the concept document |
+| Styling | Tailwind CSS 4 | Design tokens carry the client's own green wireframe palette |
+| PDF | Playwright (`chromium`) | Renders the report as HTML/CSS and prints it — see [Why Chromium, not Excel](#why-chromium-not-excel) |
+| Validation | Zod | Every server action validates input server-side regardless of client-side checks |
+
+## Getting started
+
+**Prerequisites:** Node 20.19+ (tested on 20.20.2), Docker (for Postgres), and `npx playwright install chromium` for PDF rendering.
 
 ```bash
+npm install
+npx playwright install chromium
+
+# Start Postgres (or point DATABASE_URL at an existing instance)
+docker run -d --name wcr-db \
+  -e POSTGRES_USER=wcr -e POSTGRES_PASSWORD=devpass -e POSTGRES_DB=wcr \
+  -p 5433:5432 postgres:16-alpine
+
+cp .env.example .env
+# edit .env: set DATABASE_URL and AUTH_SECRET (openssl rand -base64 32)
+
+npm run db:push    # apply schema
+npm run db:seed    # 10,000 parts, demo account, admin account
+
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open `http://localhost:3000/login` — seeded demo account is `ABC000` / `demopass`. Admin console is at `/admin/login` with `admin` / `demopass`.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+### Verifying a production build
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+`npm run build` writes to `.next`, same as `npm run dev` — running both against the same directory corrupts the dev server's cache and 500s every route until `.next` is deleted and dev is restarted. Use `npm run build:check` instead; it writes to `.next-build` and leaves the running dev server alone.
 
-## Learn More
+### Useful scripts
 
-To learn more about Next.js, take a look at the following resources:
+| Command | Purpose |
+|---|---|
+| `npm run db:studio` | Prisma Studio — browse/edit data directly |
+| `npm run db:seed` | Re-seed (idempotent — safe to re-run) |
+| `npx tsx scripts/verify-lockout.ts` | Exercises the login lockout state machine against the live DB |
+| `npx tsx scripts/verify-import.ts` | Proves the parts import is non-destructive (see below) |
+| `npx tsx scripts/verify-wizard.ts` | Idempotency, snapshot integrity, report numbering, company scoping |
+| `npx tsx scripts/verify-internal.ts` | Multi-day/overnight time totals, status transitions |
+| `npx tsx scripts/capture.ts` | Screenshots the key screens (used for client-facing docs) |
+| `npx tsx scripts/render-doc-pdf.ts` | Renders `docs/implementation-report.html` to PDF |
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## Architecture decisions
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+The concept document is detailed but was written before implementation, and several places specify something that can't be built as written, or that would break under real use. Each of these is called out with a comment at the point in the code where it matters — search for the tag to find the reasoning in context.
 
-## Deploy on Vercel
+| Tag | Decision | Why |
+|---|---|---|
+| **A-1** | PDF is rendered from HTML/CSS via headless Chromium, not generated by filling an Excel template | The specified host (さくらインターネット「ビジネス」, shared PHP hosting) can't run a document-conversion engine. This project targets Node hosting instead, which makes Chromium viable — the doc still calls this out because it's a real scope change from what was asked. |
+| **A-3** | Login lockout is 3 strikes → 15-minute auto-unlock, not permanent | Accounts are issued per *company* (concept doc, §"その他仕様"), so a permanent lock after one worker's typo locks out the entire field team until an admin manually unlocks it. `src/lib/lockout.ts`. |
+| **A-4** | `Report.uuid` (client-generated) is the upsert key; `Report.version` is an optimistic-lock counter; the human-facing report number is allocated server-side on submit | Needed for the offline story: a retried submission from a flaky connection must not create a duplicate report, and concurrent edits must not silently clobber each other. `prisma/schema.prisma`, `src/server/reports.ts::submitReport`. |
+| **B-01** | Work date is a `from`/`to` range, not a single date | The concept doc's own sample PDF (概要書 p.12) shows a date range on the printed report; the input screen only allowed one date. |
+| **B-07** | Measurement rows are add/remove, not a fixed 5 | The wireframe shows exactly 5 rows; real inspections don't have a fixed room count. |
+| **B-09** | Parts master carries a `kana` + `kanaRow` column | 50-on (五十音) sorting was requested but is impossible from kanji alone without a reading. `src/lib/kana.ts` normalizes katakana/dakuten to derive the row; `scripts/verify-import.ts` proves the classification against real data. |
+| **B-10** | Selected parts are pinned above the search results, not inline in the list | With 10,000 rows, searching for the next part scrolls previously-selected items out of view; pinning keeps the running selection visible while search results scroll independently. |
+| **B-12** | Internal-report work-time entries carry a date and support overnight spans (e.g. 22:00→01:30) | The wireframe's time fields have no date, so multi-day work and shifts crossing midnight can't be recorded or totaled correctly. `src/lib/format.ts::minutesBetween`. |
+| **B-17** | Changing account password/email requires re-entering the current password | Shared company account — an unconfirmed change locks out every field worker using that login, not just the person making the change. |
+| **B-19** | Report status is a 4-value enum (`DRAFT`/`SUBMITTED`/`INTERNAL`/`COMPLETED`), not a boolean "done" flag | The concept doc's own workflow diagram has more states than its own status field can represent. |
+| **B-23** | Report line items (parts, work items) copy the part's name/unit/code at the time of entry rather than holding a live foreign key | A parts-master re-import or edit must never rewrite the historical record of what a past report actually said. |
+| **B-24** | The parts-master CSV import is validate → review → commit, not "clear the table and reload" | A 10,000-row import that fails partway through a destructive reload leaves the master empty. The current flow computes a diff, shows it, and only writes on confirmation — in chunked transactions so a partial failure doesn't corrupt the table either. `src/server/parts.ts`, `scripts/verify-import.ts`. |
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+None of this is exhaustive — it's the set of decisions that would surprise someone reading the concept document literally and then reading the code. `docs/implementation-report.html` (and the generated PDF) walks through the same list with screenshots, for a non-technical audience.
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+## Project layout
+
+```
+prisma/schema.prisma          Source of truth for the data model; read the comments — most tags above are cross-referenced there
+prisma/seed.ts                 10,000-row parts master, demo account, admin account
+src/app/(user)/...             Field-facing tablet UI (768px design width)
+src/app/admin/...              Admin console (1600px design width)
+src/app/api/parts/route.ts     Server-side parts search (never ships all 10k rows to the client)
+src/server/*.ts                Server Actions — all mutation and validation logic lives here, not in components
+src/lib/*.ts                   Pure helpers: date math, kana normalization, session signing, PDF rendering
+scripts/*.ts                   Verification scripts and screenshot/PDF tooling (not part of the app runtime)
+docs/                          Client-facing implementation report (HTML source + generated PDF + screenshots)
+```
+
+## Known limitations
+
+- **Mail transport is unimplemented** (see [Status](#status)).
+- **Offline is Tier 1 of 3** — see the comparison table in `docs/implementation-report.html` §8 for what Tiers 2–3 would add and roughly cost.
+- **PDF generation requires Chromium at runtime.** The `chromium` launch in `src/lib/pdf.ts` needs a working browser binary in the deploy environment — trivial on a VPS (`npx playwright install chromium`), needs `@sparticuz/chromium` on serverless platforms like Vercel.
+- **`@pdfme/generator` is an unused dependency** left over from before the PDF approach settled on Chromium; safe to remove.
+- Sample/seed data (hospital names, company names, worker names) is entirely fictional and used throughout `scripts/` and in the client-facing report — never real patient- or client-identifying data.
