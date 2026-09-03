@@ -1,0 +1,39 @@
+@import "tailwindcss";
+
+/* 概要書のワイヤーフレームで使われている配色をそのままトークン化 */
+@theme {
+  --color-brand-900: #14562f;
+  --color-brand-800: #175735;
+  --color-brand-700: #1c6b3f;
+  --color-brand-600: #1e7a45;
+  --color-brand-500: #2e7d4f;
+  --color-brand-100: #e9f1eb;
+  --color-brand-50:  #f3f8f4;
+
+  --color-ink:      #111614;
+  --color-ink-2:    #33403a;
+  --color-ink-3:    #6b7873;
+  --color-line:     #9aa8a0;
+  --color-line-2:   #cbd6cf;
+  --color-alert:    #c0392b;
+
+  --font-sans: "BIZ UDPGothic", "Hiragino Sans", "Yu Gothic", "Noto Sans JP", system-ui, sans-serif;
+  --font-form: "Zen Old Mincho", "Hiragino Mincho ProN", "Yu Mincho", serif;
+  --font-mono: "JetBrains Mono", Consolas, monospace;
+}
+
+html, body { margin: 0; padding: 0; }
+body {
+  font-family: var(--font-sans);
+  color: var(--color-ink);
+  background: #eef1ee;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* タブレットでの署名描画中に画面がスクロールしないようにする */
+.signature-pad { touch-action: none; }
+
+@media print {
+  .no-print { display: none !important; }
+  body { background: #fff; }
+}

@@ -1,0 +1,321 @@
+// 作業完了報告書SYSTEM — データモデル
+//
+// 設計判断は仕様精査メモに対応する:
+//   A-3  アカウントは会社単位（概要書P6）。ロックは15分で自動解除。
+//   A-4  報告書は端末採番のuuidで冪等化し、versionで楽観ロック。
+//   B-01 作業日は期間（workDateFrom〜workDateTo）。
+//   B-02 病院はマスタ化し、表記ゆれによる検索漏れを防ぐ。
+//   B-16 報告事項・作業者は会社スコープ。部品・機種は全社共通。
+//   B-23 報告書明細は名称と単位をスナップショット保存し、マスタ入替で過去帳票が変わらないようにする。
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+/// 協力会社アカウント（ログイン単位）
+model Account {
+  id           String  @id @default(cuid())
+  accountId    String  @unique // ログインID（事務局が発行）
+  passwordHash String
+  companyName  String
+  email        String?
+  isActive     Boolean @default(true)
+
+  // A-3: 3回失敗で15分ロック。事務局による手動解除も可能。
+  failedCount Int       @default(0)
+  lockedUntil DateTime?
+
+  workers     Worker[]
+  reportNotes ReportNoteTemplate[]
+  reports     Report[]
+  createdAt   DateTime             @default(now())
+  updatedAt   DateTime             @updatedAt
+
+  @@map("accounts")
+}
+
+/// 管理者（設備会社・事務局）
+model Admin {
+  id           String    @id @default(cuid())
+  accountId    String    @unique
+  passwordHash String
+  reportEmail  String? // K-7 報告書の受信メールアドレス
+  failedCount  Int       @default(0)
+  lockedUntil  DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  @@map("admins")
+}
+
+/// 作業者（会社スコープ / B-15）。過去帳票に名前が残るため論理削除。
+model Worker {
+  id        String   @id @default(cuid())
+  accountId String
+  account   Account  @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  name      String
+  sortOrder Int      @default(0)
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([accountId, isActive])
+  @@map("workers")
+}
+
+/// 病院マスタ（B-02）
+model Hospital {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  kana      String?
+  address   String?
+  isActive  Boolean  @default(true)
+  reports   Report[]
+  createdAt DateTime @default(now())
+
+  @@map("hospitals")
+}
+
+/// 交換部品マスタ（全社共通・約1万件）
+/// B-09: 50音ソートに読み仮名が必須。B-23: 論理削除。
+model Part {
+  id        Int      @id @default(autoincrement())
+  code      String   @unique
+  name      String
+  kana      String
+  kanaRow   String // あ/か/さ… 50音行
+  unit      String
+  priority  Int      @default(0)
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([kanaRow, kana])
+  @@index([name])
+  @@map("parts")
+}
+
+/// 機種名マスタ（全社共通）
+model EquipmentModel {
+  id        Int      @id @default(autoincrement())
+  name      String   @unique
+  kana      String?
+  sortOrder Int      @default(0)
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  @@map("equipment_models")
+}
+
+/// 報告事項マスタ（管理者が配布する共通定型文 / K-6）
+model NoteTemplate {
+  id        Int      @id @default(autoincrement())
+  body      String
+  sortOrder Int      @default(0)
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  @@map("note_templates")
+}
+
+/// 報告事項テーブル（会社ごとの追加分 / 5-3, B-16）
+model ReportNoteTemplate {
+  id        Int      @id @default(autoincrement())
+  accountId String
+  account   Account  @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  body      String
+  createdAt DateTime @default(now())
+
+  @@index([accountId])
+  @@map("report_note_templates")
+}
+
+/// 確認事項（2-5のチェック項目。文言未定のためマスタ化 / B-04）
+model ConfirmItem {
+  id        Int     @id @default(autoincrement())
+  body      String
+  sortOrder Int     @default(0)
+  isActive  Boolean @default(true)
+
+  @@map("confirm_items")
+}
+
+enum ReportStatus {
+  DRAFT // 下書き
+  SUBMITTED // 提出済
+  INTERNAL // 社内用作成済
+  COMPLETED // 完了（請求済）
+}
+
+/// 作業完了報告書
+model Report {
+  id       String @id @default(cuid())
+  /// A-4: 端末が採番。オフライン中の重複送信をupsertで吸収する冪等キー。
+  uuid     String @unique
+  /// 帳票No.はサーバ採番。同期成立まではnull。
+  reportNo Int?   @unique
+  version  Int    @default(1)
+
+  accountId    String
+  account      Account   @relation(fields: [accountId], references: [id])
+  hospitalId   String?
+  hospital     Hospital? @relation(fields: [hospitalId], references: [id])
+  hospitalName String // スナップショット
+
+  createdDate  DateTime  @db.Date
+  workDateFrom DateTime  @db.Date
+  workDateTo   DateTime? @db.Date // B-01: 期間
+  workPlace    String
+  workTitle    String
+
+  workerNames   String[] // スナップショット
+  freeWorkNote  String   @default("")
+  partsFreeNote String   @default("")
+  reportBody    String   @default("")
+
+  checkedItems  Int[] // チェック済ConfirmItem.id
+  signerName    String  @default("")
+  signatureData String? // PNG dataURL
+
+  status      ReportStatus @default(DRAFT)
+  submittedAt DateTime?
+  completedAt DateTime?
+
+  workItems    ReportWorkItem[]
+  partItems    ReportPartItem[]
+  measurements ReportMeasurement[]
+  internal     InternalReport?
+  mailLogs     MailLog[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([accountId, workDateFrom])
+  @@index([status])
+  @@map("reports")
+}
+
+/// 作業内容（2-2）
+model ReportWorkItem {
+  id        String @id @default(cuid())
+  reportId  String
+  report    Report @relation(fields: [reportId], references: [id], onDelete: Cascade)
+  modelName String // スナップショット
+  quantity  Int    @default(0)
+  sortOrder Int    @default(0)
+
+  @@index([reportId])
+  @@map("report_work_items")
+}
+
+/// 交換部品（2-3）。B-23によりFKではなく名称・単位をコピー。
+model ReportPartItem {
+  id        String @id @default(cuid())
+  reportId  String
+  report    Report @relation(fields: [reportId], references: [id], onDelete: Cascade)
+  partId    Int? // 参照のみ。表示には使わない。
+  partCode  String @default("")
+  partName  String
+  unit      String
+  quantity  Int    @default(0)
+  sortOrder Int    @default(0)
+
+  @@index([reportId])
+  @@map("report_part_items")
+}
+
+/// 測定値（2-4）。B-07により可変行。
+model ReportMeasurement {
+  id             String @id @default(cuid())
+  reportId       String
+  report         Report @relation(fields: [reportId], references: [id], onDelete: Cascade)
+  roomName       String @default("")
+  modelName      String @default("")
+  runningHours   Int? // 0〜100,000h
+  serialNo       String @default("")
+  manufacturedYm String @default("") // YYYY-MM
+  sortOrder      Int    @default(0)
+
+  @@index([reportId])
+  @@map("report_measurements")
+}
+
+/// 社内用報告書（4-1〜4-6）
+model InternalReport {
+  id            String                @id @default(cuid())
+  reportId      String                @unique
+  report        Report                @relation(fields: [reportId], references: [id], onDelete: Cascade)
+  remainingWork String                @default("")
+  salesApproach String                @default("")
+  remarks       String                @default("")
+  reorderItems  InternalReorderItem[]
+  workTimes     InternalWorkTime[]
+  createdAt     DateTime              @default(now())
+  updatedAt     DateTime              @updatedAt
+
+  @@map("internal_reports")
+}
+
+/// 再手配の必要な部材（4-3）
+model InternalReorderItem {
+  id               String         @id @default(cuid())
+  internalReportId String
+  internalReport   InternalReport @relation(fields: [internalReportId], references: [id], onDelete: Cascade)
+  partId           Int?
+  partCode         String         @default("")
+  partName         String
+  unit             String
+  quantity         Int            @default(0)
+  sortOrder        Int            @default(0)
+
+  @@index([internalReportId])
+  @@map("internal_reorder_items")
+}
+
+/// 移動および作業時間（4-4）。B-12により日付を持たせ日跨ぎに対応。
+model InternalWorkTime {
+  id               String         @id @default(cuid())
+  internalReportId String
+  internalReport   InternalReport @relation(fields: [internalReportId], references: [id], onDelete: Cascade)
+  workDate         DateTime       @db.Date
+  goStart          String         @default("") // HH:mm
+  goEnd            String         @default("")
+  workStart        String         @default("")
+  workEnd          String         @default("")
+  backStart        String         @default("")
+  backEnd          String         @default("")
+  sortOrder        Int            @default(0)
+
+  @@index([internalReportId])
+  @@map("internal_work_times")
+}
+
+/// メール送信ログ（3の Mail 回数 / 踏み台対策の監査証跡）
+model MailLog {
+  id        String   @id @default(cuid())
+  reportId  String
+  report    Report   @relation(fields: [reportId], references: [id], onDelete: Cascade)
+  toAddress String
+  ccAddress String   @default("")
+  subject   String
+  body      String   @default("")
+  sentAt    DateTime @default(now())
+  succeeded Boolean  @default(true)
+  errorText String?
+
+  @@index([reportId])
+  @@map("mail_logs")
+}
+
+/// 帳票No.の採番（同期時にサーバ側で確定 / A-4）
+model ReportCounter {
+  id     Int @id @default(1)
+  lastNo Int @default(1000)
+
+  @@map("report_counter")
+}
